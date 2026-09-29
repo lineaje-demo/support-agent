@@ -71,6 +71,74 @@ class FileManagementAgent:
         if dry_run:
             logger.warning("Agent running in DRY RUN mode - no actual changes will be made")
     
+    def _sanitize_mcp_result(self, raw_result, tool_name: str):
+        """
+        Validate and sanitize output from an MCP server tool call.
+
+        Args:
+            raw_result: The raw result returned by the MCP tool.
+            tool_name: Name of the MCP tool that produced the result.
+
+        Returns:
+            Sanitized result safe for further processing.
+
+        Raises:
+            ValueError: If the result fails validation.
+        """
+        # Reject None results
+        if raw_result is None:
+            raise ValueError(f"MCP tool '{tool_name}' returned None")
+
+        # If result is a string, sanitize it
+        if isinstance(raw_result, str):
+            # Strip null bytes and control characters (except newline/tab)
+            sanitized = ''.join(
+                ch for ch in raw_result
+                if ch in ('\n', '\t') or (ord(ch) >= 32 and ord(ch) != 127)
+            )
+            # Enforce a reasonable max length to prevent resource exhaustion
+            max_len = 10000
+            if len(sanitized) > max_len:
+                logger.warning(f"MCP tool '{tool_name}' result truncated from {len(sanitized)} to {max_len} chars")
+                sanitized = sanitized[:max_len]
+            return sanitized
+
+        # If result is a dict, validate expected keys and sanitize values
+        if isinstance(raw_result, dict):
+            sanitized_dict = {}
+            allowed_keys = {'status', 'message', 'filename', 'success', 'error', 'deleted', 'result'}
+            for key, value in raw_result.items():
+                # Only allow known/expected keys
+                if key not in allowed_keys:
+                    logger.warning(f"MCP tool '{tool_name}': unexpected key '{key}' removed from result")
+                    continue
+                # Recursively sanitize string values
+                if isinstance(value, str):
+                    value = ''.join(
+                        ch for ch in value
+                        if ch in ('\n', '\t') or (ord(ch) >= 32 and ord(ch) != 127)
+                    )
+                    if len(value) > 5000:
+                        value = value[:5000]
+                elif isinstance(value, bool):
+                    pass  # booleans are safe
+                elif isinstance(value, (int, float)):
+                    pass  # numbers are safe
+                elif value is not None:
+                    logger.warning(f"MCP tool '{tool_name}': unexpected type {type(value).__name__} for key '{key}'")
+                    value = str(value)[:5000]
+                sanitized_dict[key] = value
+            return sanitized_dict
+
+        # If result is a bool or number, allow it
+        if isinstance(raw_result, (bool, int, float)):
+            return raw_result
+
+        # Reject unexpected types
+        raise ValueError(
+            f"MCP tool '{tool_name}' returned unexpected type: {type(raw_result).__name__}"
+        )
+
     def log_operation(self, operation: str, status: str, details: Dict):
         """Log operation for audit trail."""
         log_entry = {
@@ -82,6 +150,32 @@ class FileManagementAgent:
         self.operations_log.append(log_entry)
         logger.info(f"Operation: {operation} - Status: {status}")
     
+    @staticmethod
+    def _validate_id(value, name: str) -> int:
+        """
+        Validate that a given value is a safe integer ID.
+        
+        Args:
+            value: The value to validate
+            name: Human-readable name for error messages
+            
+        Returns:
+            The validated integer ID
+            
+        Raises:
+            ValueError: If the value is not a valid integer ID
+        """
+        try:
+            int_val = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {name}: must be an integer")
+        # Ensure the string representation is purely numeric (no embedded special chars)
+        if not re.fullmatch(r'-?\d+', str(value).strip()):
+            raise ValueError(f"Invalid {name}: contains disallowed characters")
+        if int_val < 0:
+            raise ValueError(f"Invalid {name}: must be non-negative")
+        return int_val
+
     def get_file_from_api(self, file_id: int) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Retrieve file contents from API endpoint.
@@ -96,7 +190,8 @@ class FileManagementAgent:
         logger.info(f"Attempting to retrieve file with ID: {file_id}")
         
         try:
-            url = f"{self.GET_FILE_API}?id={file_id}"
+            validated_file_id = self._validate_id(file_id, "file_id")
+            url = f"{self.GET_FILE_API}?{urlencode({'id': validated_file_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
@@ -207,7 +302,8 @@ class FileManagementAgent:
         logger.info(f"Attempting to purge records with ID: {record_id}")
         
         try:
-            url = f"{self.PURGE_RECORDS_API}?id={record_id}"
+            validated_record_id = self._validate_id(record_id, "record_id")
+            url = f"{self.PURGE_RECORDS_API}?{urlencode({'id': validated_record_id})}"
             
             if self.dry_run:
                 logger.info(f"DRY RUN: Would call GET {url}")
