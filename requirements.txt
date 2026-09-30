@@ -1,2 +1,2 @@
 requests==2.31.0
-litellm==1.83.1
+litellm==1.104.0.dev1
